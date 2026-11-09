@@ -1,0 +1,55 @@
+name: Deploy to Cloudflare Pages
+
+# Builds the app and deploys it to the Cloudflare Pages project
+# "dusrel-consumer-test" on every push. Pushes to main deploy to
+# production; pushes to any other branch create preview deployments.
+#
+# Required repository secrets (Settings -> Secrets and variables ->
+# Actions):
+#   CLOUDFLARE_API_TOKEN   API token with Account -> Cloudflare
+#                          Pages -> Edit permission (the "Edit
+#                          Cloudflare Workers" template also works)
+#   CLOUDFLARE_ACCOUNT_ID  Account ID from the Cloudflare dashboard
+#                          (Workers & Pages -> Overview)
+#
+# The Pages project is created automatically by the first run if it
+# does not exist yet.
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  deployments: write
+
+concurrency:
+  group: cloudflare-pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Ensure the Pages project exists
+        uses: cloudflare/wrangler-action@v4
+        continue-on-error: true
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages project create dusrel-consumer-test --production-branch=main
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy dist --project-name=dusrel-consumer-test --branch=${{ github.ref_name }}
+          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
