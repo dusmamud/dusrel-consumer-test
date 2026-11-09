@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { DusrelCrop, useProcessImage } from "@dusrel/image-react";
+import { DusrelCrop, useProcessBatch, useProcessImage } from "@dusrel/image-react";
 import {
   encode as encodeJpeg,
   decode as decodeJpeg,
@@ -16,14 +16,15 @@ import { optimize as optimizePng } from "@dusrel/image-oxipng";
 import { quantize } from "@dusrel/image-quantize";
 import { resize } from "@dusrel/image-resize";
 import { flipHorizontal, rotateQuarter } from "@dusrel/image-transform";
-import { grayscale } from "@dusrel/image-adjust";
+import { adjust, grayscale } from "@dusrel/image-adjust";
 import { hasGps, readMetadata, stripMetadata } from "@dusrel/image-metadata";
 import { applyWatermark } from "@dusrel/image-watermark";
 import { optimizeSvg } from "@dusrel/image-svg";
 import { runBatch } from "@dusrel/image-batch";
 import { initialCrop } from "@dusrel/image-crop";
 import { processImage as coreProcessImage } from "@dusrel/image-core";
-import { processImage, toImageData } from "@dusrel/image";
+import { blobToImageData, imageDataPlugin, processImage, toImageData } from "@dusrel/image";
+import type { ImageOptions, ImagePlugin } from "@dusrel/image";
 import {
   decodeBlurHash,
   decodeThumbHash,
@@ -145,6 +146,558 @@ function drawGradient(canvas: HTMLCanvasElement) {
   ctx.fillText("@dusrel consumer test", 12, 30);
 }
 
+/* ------------------------------------------------------------------ */
+/* Process studio — the flagship's full option surface, driven by      */
+/* useProcessImage. Everything below is a @dusrel package or a         */
+/* browser API; no third-party code is involved.                       */
+/* ------------------------------------------------------------------ */
+
+const FORMAT_OPTIONS = [
+  { id: "canvas-webp", label: "WebP — canvas", format: "image/webp", codec: null },
+  { id: "canvas-jpeg", label: "JPEG — canvas", format: "image/jpeg", codec: null },
+  { id: "canvas-png", label: "PNG — canvas", format: "image/png", codec: null },
+  { id: "wasm-avif", label: "AVIF — WASM · libaom", format: "image/avif", codec: "avif" },
+  { id: "wasm-jpeg", label: "JPEG — WASM · MozJPEG", format: "image/jpeg", codec: "jpeg" },
+  { id: "wasm-webp", label: "WebP — WASM · libwebp", format: "image/webp", codec: "webp" },
+  { id: "wasm-png", label: "PNG — WASM · Rust", format: "image/png", codec: "png" },
+  { id: "wasm-jxl", label: "JPEG XL — WASM · libjxl", format: "image/jxl", codec: "jxl" },
+  { id: "wasm-qoi", label: "QOI — WASM", format: "image/qoi", codec: "qoi" },
+  { id: "wasm-gif", label: "GIF — WASM · single frame", format: "image/gif", codec: "gif" },
+] as const;
+
+type FormatOption = (typeof FORMAT_OPTIONS)[number];
+
+function codecDef(codec: NonNullable<FormatOption["codec"]>, quality100: number) {
+  switch (codec) {
+    case "avif":
+      return { mimeType: "image/avif", encode: (d: ImageData) => encodeAvif(d, { quality: quality100, speed: 9 }) };
+    case "jpeg":
+      return { mimeType: "image/jpeg", encode: (d: ImageData) => encodeJpeg(d, { quality: quality100 }) };
+    case "webp":
+      return { mimeType: "image/webp", encode: (d: ImageData) => encodeWebp(d, { quality: quality100 }) };
+    case "png":
+      return { mimeType: "image/png", encode: (d: ImageData) => encodePng(d) };
+    case "jxl":
+      return { mimeType: "image/jxl", encode: (d: ImageData) => encodeJxl(d, { quality: quality100 }) };
+    case "qoi":
+      return { mimeType: "image/qoi", encode: (d: ImageData) => encodeQoi(d) };
+    case "gif":
+      return { mimeType: "image/gif", encode: async (d: ImageData) => encodeGif([{ data: d }]) };
+  }
+}
+
+/** Renders watermark text to a pixel mark with plain canvas APIs. */
+function makeTextMark(text: string, imageWidth: number) {
+  const fontSize = Math.max(14, Math.round(imageWidth / 18));
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d")!;
+  ctx.font = `600 ${fontSize}px system-ui, sans-serif`;
+  const w = Math.ceil(ctx.measureText(text).width) + 16;
+  canvas.width = w;
+  canvas.height = fontSize + 16;
+  const c2 = canvas.getContext("2d")!;
+  c2.font = `600 ${fontSize}px system-ui, sans-serif`;
+  c2.fillStyle = "#ffffff";
+  c2.textBaseline = "middle";
+  c2.fillText(text, 8, canvas.height / 2);
+  const img = c2.getImageData(0, 0, canvas.width, canvas.height);
+  return { data: img.data, width: img.width, height: img.height };
+}
+
+const POSITIONS = [
+  "top-left",
+  "top-right",
+  "bottom-left",
+  "bottom-right",
+  "center",
+  "tile",
+] as const;
+
+function ProcessStudio({
+  onShare,
+}: {
+  onShare?: (s: { file: Blob; url: string; name: string }) => void;
+}) {
+  const proc = useProcessImage();
+  const batch = useProcessBatch();
+  const [picked, setPicked] = useState<Blob | null>(null);
+  const [pickedLabel, setPickedLabel] = useState<string>("");
+  const [originalBytes, setOriginalBytes] = useState<Uint8Array | null>(null);
+  const [originalType, setOriginalType] = useState<string>("");
+  const [stripOut, setStripOut] = useState<{ url: string; before: number; after: number } | null>(null);
+  const [batchFiles, setBatchFiles] = useState<File[]>([]);
+  const [batchOut, setBatchOut] = useState<
+    { name: string; size?: number; url?: string; error?: string }[]
+  >([]);
+  const [inputUrl, setInputUrl] = useState<string>("");
+  const [inputMeta, setInputMeta] = useState<string[]>([]);
+  const [formatId, setFormatId] = useState<string>("canvas-webp");
+  const [quality, setQuality] = useState(85);
+  const [resizeW, setResizeW] = useState("800");
+  const [resizeH, setResizeH] = useState("");
+  const [fit, setFit] = useState<"inside" | "cover" | "fill">("inside");
+  const [cropX, setCropX] = useState("");
+  const [cropY, setCropY] = useState("");
+  const [cropW, setCropW] = useState("");
+  const [cropH, setCropH] = useState("");
+  const [rotate, setRotate] = useState(0);
+  const [flipH, setFlipH] = useState(false);
+  const [flipV, setFlipV] = useState(false);
+  const [background, setBackground] = useState("#ffffff");
+  const [maxKb, setMaxKb] = useState("");
+  const [fallback, setFallback] = useState<"throw" | "return-original" | "downgrade-format">("throw");
+  const [adjB, setAdjB] = useState(0);
+  const [adjC, setAdjC] = useState(0);
+  const [adjS, setAdjS] = useState(0);
+  const [adjE, setAdjE] = useState(0);
+  const [adjHue, setAdjHue] = useState(0);
+  const [adjGray, setAdjGray] = useState(false);
+  const [adjSepia, setAdjSepia] = useState(false);
+  const [wmText, setWmText] = useState("");
+  const [wmPos, setWmPos] = useState<(typeof POSITIONS)[number]>("bottom-right");
+  const [wmOpacity, setWmOpacity] = useState(0.7);
+  const [outUrl, setOutUrl] = useState<string>("");
+
+  useEffect(() => {
+    if (!proc.result) return;
+    const url = URL.createObjectURL(proc.result.blob);
+    setOutUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [proc.result]);
+
+  const onPick = async (file: File | null) => {
+    setInputMeta([]);
+    setStripOut(null);
+    setOriginalBytes(null);
+    if (!file) {
+      setPicked(null);
+      setPickedLabel("");
+      return;
+    }
+    setPickedLabel(`${file.name} · ${fmtBytes(file.size)}`);
+    try {
+      const buf = new Uint8Array(await file.arrayBuffer());
+      setOriginalBytes(buf);
+      setOriginalType(file.type);
+      const info = readMetadata(buf);
+      const lines: string[] = [`format · ${info.format ?? file.type ?? "unknown"}`];
+      let effective: Blob = file;
+      if (isHeic(buf)) {
+        // Browsers other than Safari cannot decode HEIC natively — the
+        // WASM decoder turns it into pixels, and every tool below then
+        // works on the decoded image.
+        const img = await decodeHeic(buf);
+        const canvas = document.createElement("canvas");
+        canvas.width = img.width;
+        canvas.height = img.height;
+        canvas.getContext("2d")!.putImageData(img, 0, 0);
+        effective = await new Promise<Blob>((resolve, reject) =>
+          canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("canvas.toBlob failed"))), "image/png"),
+        );
+        lines.push(`dimensions · ${img.width}×${img.height}`);
+        lines.push("heic · decoded in-browser via WASM — tools run on the decoded pixels");
+      } else {
+        const bmp = await createImageBitmap(file).catch(() => null);
+        if (bmp) lines.push(`dimensions · ${bmp.width}×${bmp.height}`);
+      }
+      if (info.exif?.make || info.exif?.model)
+        lines.push(`camera · ${[info.exif.make, info.exif.model].filter(Boolean).join(" ")}`);
+      if (info.exif?.dateTimeOriginal) lines.push(`taken · ${info.exif.dateTimeOriginal}`);
+      if (info.exif?.gps)
+        lines.push(`gps · ${info.exif.gps.latitude.toFixed(5)}, ${info.exif.gps.longitude.toFixed(5)}`);
+      lines.push(info.exifPresent ? "exif · present (output re-encode strips it)" : "exif · none");
+      if (info.iccPresent) lines.push("icc · present");
+      setInputMeta(lines);
+      setPicked(effective);
+      const url = URL.createObjectURL(effective);
+      setInputUrl(url);
+      onShare?.({ file: effective, url, name: file.name });
+    } catch {
+      setPicked(file);
+      setInputUrl(URL.createObjectURL(file));
+      setInputMeta(["metadata · could not be read"]);
+    }
+  };
+
+  const onStrip = () => {
+    if (!originalBytes) return;
+    const stripped = stripMetadata(originalBytes);
+    const blob = new Blob([stripped as BlobPart], { type: originalType || "image/jpeg" });
+    setStripOut({
+      url: URL.createObjectURL(blob),
+      before: originalBytes.length,
+      after: stripped.length,
+    });
+  };
+
+  useEffect(() => {
+    if (!batch.results) return;
+    setBatchOut(
+      batch.results.map((r, i) =>
+        r.status === "fulfilled"
+          ? {
+              name: batchFiles[i]?.name ?? `file ${i + 1}`,
+              size: r.result.blob.size,
+              url: URL.createObjectURL(r.result.blob),
+            }
+          : {
+              name: batchFiles[i]?.name ?? `file ${i + 1}`,
+              error: r.error instanceof Error ? r.error.message : String(r.error),
+            },
+      ),
+    );
+    // batchFiles is read for names only; results identity drives this.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [batch.results]);
+
+  const buildOptions = (): ImageOptions => {
+    const fmt = FORMAT_OPTIONS.find((f) => f.id === formatId) ?? FORMAT_OPTIONS[0]!;
+    const options: ImageOptions = {
+      format: fmt.format,
+      quality: quality / 100,
+      fallback,
+      background,
+    };
+    if (resizeW || resizeH) {
+      options.resize = {
+        ...(resizeW ? { width: Number(resizeW) } : {}),
+        ...(resizeH ? { height: Number(resizeH) } : {}),
+        fit,
+      };
+    }
+    if (cropX && cropY && cropW && cropH) {
+      options.crop = { x: Number(cropX), y: Number(cropY), width: Number(cropW), height: Number(cropH) };
+    }
+    if (rotate) options.rotate = rotate;
+    if (flipH) options.flipHorizontal = true;
+    if (flipV) options.flipVertical = true;
+    if (maxKb) options.maxSizeBytes = Number(maxKb) * 1024;
+    if (fmt.codec) options.codecs = [codecDef(fmt.codec, quality)];
+    const plugins: ImagePlugin[] = [];
+    if (adjB || adjC || adjS || adjE || adjHue || adjGray || adjSepia) {
+      plugins.push(
+        imageDataPlugin({
+          name: "adjust",
+          transform: (d) =>
+            adjust(d, {
+              brightness: adjB / 100,
+              contrast: adjC / 100,
+              saturation: adjS / 100,
+              exposure: adjE / 10,
+              hueRotate: adjHue,
+              grayscale: adjGray,
+              sepia: adjSepia,
+            }),
+        }),
+      );
+    }
+    if (wmText.trim()) {
+      plugins.push(
+        imageDataPlugin({
+          name: "watermark",
+          transform: (d) =>
+            applyWatermark(d, makeTextMark(wmText.trim(), d.width), {
+              position: wmPos,
+              opacity: wmOpacity,
+            }),
+        }),
+      );
+    }
+    if (plugins.length) options.plugins = plugins;
+    return options;
+  };
+
+  const runProcess = () => {
+    if (!picked) return;
+    void proc.process(picked, buildOptions());
+  };
+
+  const runBatchAll = () => {
+    if (!batchFiles.length) return;
+    setBatchOut([]);
+    void batch.process(batchFiles, { ...buildOptions(), concurrency: 3 });
+  };
+
+  const num = (
+    label: string,
+    value: string,
+    set: (v: string) => void,
+    placeholder?: string,
+  ) => (
+    <label className="field">
+      <span>{label}</span>
+      <input type="number" min={0} value={value} placeholder={placeholder} onChange={(e) => set(e.target.value)} />
+    </label>
+  );
+  const range = (label: string, value: number, set: (v: number) => void, min: number, max: number, suffix: string) => (
+    <label className="field">
+      <span>
+        {label} · {value}
+        {suffix}
+      </span>
+      <input type="range" min={min} max={max} value={value} onChange={(e) => set(Number(e.target.value))} />
+    </label>
+  );
+
+  const fmt = FORMAT_OPTIONS.find((f) => f.id === formatId);
+  const displayable = ["image/jpeg", "image/png", "image/webp", "image/avif", "image/gif"].includes(
+    proc.result?.format ?? "",
+  );
+
+  return (
+    <section className="panel">
+      <div className="panel-head">
+        <span className="panel-index">05</span>
+        <h2>Process a file</h2>
+        <span className="panel-note">full option surface · useProcessImage</span>
+      </div>
+
+      <div className="controls">
+        <label className="file-label">
+          Choose an image
+          <input
+            className="file-input"
+            type="file"
+            accept="image/*"
+            onChange={(e) => void onPick(e.target.files?.[0] ?? null)}
+          />
+        </label>
+        {picked && <span className="file-name">{pickedLabel}</span>}
+      </div>
+
+      {picked && (
+        <div className="preview-grid">
+          <div>
+            {inputUrl && <img className="frame preview-img" src={inputUrl} alt="Original upload" />}
+            <div className="frame-caption">original</div>
+            {inputMeta.length > 0 && (
+              <ul className="meta-lines">
+                {inputMeta.map((l) => (
+                  <li key={l}>{l}</li>
+                ))}
+              </ul>
+            )}
+            {originalBytes && (
+              <div className="controls">
+                <button className="btn-primary" onClick={onStrip}>
+                  Download with metadata stripped
+                </button>
+                {stripOut && (
+                  <a className="file-label" href={stripOut.url} download="stripped">
+                    stripped copy · {fmtBytes(stripOut.before)} → {fmtBytes(stripOut.after)}
+                  </a>
+                )}
+              </div>
+            )}
+          </div>
+          <div>
+            {proc.result && outUrl && displayable && (
+              <>
+                <img className="frame preview-img" src={outUrl} alt="Processed output" />
+                <div className="frame-caption">processed · {proc.result.format}</div>
+              </>
+            )}
+            {proc.result && !displayable && (
+              <p className="waiting">
+                This browser cannot display {proc.result.format} inline — use Download to inspect
+                the file.
+              </p>
+            )}
+            {!proc.result && <p className="waiting">Processed output appears here</p>}
+          </div>
+        </div>
+      )}
+
+      <div className="studio-grid">
+        <label className="field">
+          <span>Output format</span>
+          <select value={formatId} onChange={(e) => setFormatId(e.target.value)}>
+            {FORMAT_OPTIONS.map((f) => (
+              <option key={f.id} value={f.id}>
+                {f.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        {range("Quality", quality, setQuality, 5, 100, "")}
+        {num("Resize width (px)", resizeW, setResizeW, "auto")}
+        {num("Resize height (px)", resizeH, setResizeH, "auto")}
+        <label className="field">
+          <span>Resize fit</span>
+          <select value={fit} onChange={(e) => setFit(e.target.value as typeof fit)}>
+            <option value="inside">inside — fit, keep aspect</option>
+            <option value="cover">cover — fill, crop overflow</option>
+            <option value="fill">fill — stretch exactly</option>
+          </select>
+        </label>
+        {num("Target size (KB)", maxKb, setMaxKb, "off")}
+        {num("Crop x", cropX, setCropX, "off")}
+        {num("Crop y", cropY, setCropY, "off")}
+        {num("Crop width", cropW, setCropW, "off")}
+        {num("Crop height", cropH, setCropH, "off")}
+        <label className="field">
+          <span>Rotate</span>
+          <select value={rotate} onChange={(e) => setRotate(Number(e.target.value))}>
+            <option value={0}>0°</option>
+            <option value={90}>90°</option>
+            <option value={180}>180°</option>
+            <option value={270}>270°</option>
+            <option value={45}>45°</option>
+            <option value={-30}>−30°</option>
+          </select>
+        </label>
+        <label className="field">
+          <span>Background (JPEG flatten)</span>
+          <input type="color" value={background} onChange={(e) => setBackground(e.target.value)} />
+        </label>
+        <label className="field">
+          <span>Fallback policy</span>
+          <select value={fallback} onChange={(e) => setFallback(e.target.value as typeof fallback)}>
+            <option value="throw">throw on failure</option>
+            <option value="return-original">return original</option>
+            <option value="downgrade-format">downgrade format</option>
+          </select>
+        </label>
+        <div className="field field-checks">
+          <span>Flip</span>
+          <label>
+            <input type="checkbox" checked={flipH} onChange={(e) => setFlipH(e.target.checked)} /> horizontal
+          </label>
+          <label>
+            <input type="checkbox" checked={flipV} onChange={(e) => setFlipV(e.target.checked)} /> vertical
+          </label>
+        </div>
+        {range("Brightness", adjB, setAdjB, -100, 100, "")}
+        {range("Contrast", adjC, setAdjC, -100, 100, "")}
+        {range("Saturation", adjS, setAdjS, -100, 100, "")}
+        {range("Exposure (×0.1 EV)", adjE, setAdjE, -30, 30, "")}
+        {range("Hue rotate", adjHue, setAdjHue, -180, 180, "°")}
+        <div className="field field-checks">
+          <span>Filters (adjust plugin)</span>
+          <label>
+            <input type="checkbox" checked={adjGray} onChange={(e) => setAdjGray(e.target.checked)} /> grayscale
+          </label>
+          <label>
+            <input type="checkbox" checked={adjSepia} onChange={(e) => setAdjSepia(e.target.checked)} /> sepia
+          </label>
+        </div>
+        <label className="field">
+          <span>Watermark text</span>
+          <input
+            type="text"
+            value={wmText}
+            placeholder="off"
+            onChange={(e) => setWmText(e.target.value)}
+          />
+        </label>
+        <label className="field">
+          <span>Watermark position</span>
+          <select value={wmPos} onChange={(e) => setWmPos(e.target.value as typeof wmPos)}>
+            {POSITIONS.map((p) => (
+              <option key={p} value={p}>
+                {p}
+              </option>
+            ))}
+          </select>
+        </label>
+        {range("Watermark opacity", Math.round(wmOpacity * 100), (v) => setWmOpacity(v / 100), 10, 100, "%")}
+      </div>
+
+      <div className="controls">
+        <button className="btn-primary" disabled={!picked || proc.status === "processing"} onClick={runProcess}>
+          Process image
+        </button>
+        {proc.result && outUrl && (
+          <a className="file-label" href={outUrl} download={`processed.${(proc.result.format.split("/")[1] ?? "bin").replace("jpeg", "jpg")}`}>
+            Download result
+          </a>
+        )}
+        {fmt?.codec && <span className="file-name">WASM codec loads on first use</span>}
+      </div>
+
+      <p className="status-line" data-testid="process-status">
+        status · {proc.status}
+        {proc.step ? ` · step ${proc.step}` : ""}
+        {typeof proc.progress === "number" ? ` · ${Math.round(proc.progress * 100)}%` : ""}
+      </p>
+      {proc.result && (
+        <p className="readout" data-testid="process-result">
+          {proc.result.format} · {fmtBytes(proc.result.blob.size)} · {proc.result.width}×
+          {proc.result.height} · saved {Math.round((proc.result.report?.savingsRatio ?? 0) * 100)}% ·{" "}
+          {Math.round(proc.result.report?.durationMs ?? 0)} ms
+          {proc.result.report?.stepsApplied?.length
+            ? ` · steps ${proc.result.report.stepsApplied.join(" → ")}`
+            : ""}
+          {proc.result.report?.fallbacks?.length
+            ? ` · fallbacks ${proc.result.report.fallbacks.join(", ")}`
+            : ""}
+          {proc.result.targetSizeMet !== undefined
+            ? ` · target ${proc.result.targetSizeMet ? "met" : "not met (best effort)"}`
+            : ""}
+        </p>
+      )}
+      {proc.error != null && (
+        <p className="readout readout-error">
+          {proc.error instanceof Error ? proc.error.message : String(proc.error)}
+        </p>
+      )}
+
+      <div className="panel-head">
+        <h2>Batch mode</h2>
+        <span className="panel-note">same settings, many files · useProcessBatch</span>
+      </div>
+      <div className="controls">
+        <label className="file-label">
+          Choose several images
+          <input
+            className="file-input"
+            type="file"
+            accept="image/*"
+            multiple
+            onChange={(e) => setBatchFiles(Array.from(e.target.files ?? []))}
+          />
+        </label>
+        {batchFiles.length > 0 && (
+          <span className="file-name">{batchFiles.length} files selected</span>
+        )}
+        <button
+          className="btn-primary"
+          disabled={!batchFiles.length || batch.status === "processing"}
+          onClick={runBatchAll}
+        >
+          Process all with the settings above
+        </button>
+      </div>
+      {(batch.status === "processing" || batchOut.length > 0) && (
+        <p className="status-line">
+          batch · {batch.status} · {batch.completed}/{batch.total} done
+        </p>
+      )}
+      {batchOut.length > 0 && (
+        <ul className="meta-lines">
+          {batchOut.map((b) => (
+            <li key={b.name}>
+              {b.name} ·{" "}
+              {b.error ? (
+                <span className="readout-error">{b.error}</span>
+              ) : (
+                <>
+                  {b.size !== undefined ? fmtBytes(b.size) : ""}{" "}
+                  {b.url && (
+                    <a href={b.url} download={`processed-${b.name}`}>
+                      download
+                    </a>
+                  )}
+                </>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
 export default function App() {
   const labCanvasRef = useRef<HTMLCanvasElement>(null);
   const thumbCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -152,8 +705,32 @@ export default function App() {
   const [demoUrl, setDemoUrl] = useState<string>("");
   const [crop, setCrop] = useState<CropRect | null>(null);
   const [hashes, setHashes] = useState<{ thumb: string; blur: string } | null>(null);
-  const proc = useProcessImage();
-  const [picked, setPicked] = useState<File | null>(null);
+  const [hashSource, setHashSource] = useState<string>("built-in test image");
+  // The visitor's uploaded image, shared across sections: the studio
+  // sets it, the crop component and the placeholder generator use it —
+  // one upload, every tool.
+  const [shared, setShared] = useState<{ file: Blob; url: string; name: string } | null>(null);
+
+  const useUploadedForHashes = async () => {
+    if (!shared) return;
+    try {
+      const img = await blobToImageData(shared.file);
+      const struct = { data: img.data, width: img.width, height: img.height };
+      const thumb = encodeThumbHash(struct);
+      const blur = encodeBlurHash(struct);
+      const back = decodeThumbHash(thumb);
+      const tc = thumbCanvasRef.current;
+      if (tc) {
+        tc.width = back.width;
+        tc.height = back.height;
+        tc.getContext("2d")!.putImageData(toImageData(back), 0, 0);
+      }
+      setHashes({ thumb: thumbHashToBase64(thumb), blur });
+      setHashSource(`your upload · ${img.width}×${img.height}`);
+    } catch {
+      setHashSource("could not decode that upload");
+    }
+  };
 
   const log = (id: string, ok: boolean | null, text: string) =>
     setLines((prev) => [...prev.filter((l) => l.id !== id), { id, ok, text }]);
@@ -194,6 +771,8 @@ export default function App() {
           decodeWasmUrl: jpegDecWasm,
         });
         const out = bytes(await encodeJpeg(pixels, { quality: 82 }));
+        if (out.length === 0 || out[0] !== 0xff || out[1] !== 0xd8)
+          throw new Error(`invalid JPEG after setCodecAssets (${out.length} bytes)`);
         return `${fmtBytes(out.length)} via setCodecAssets(?url)`;
       });
       await check("jpeg-roundtrip", async () => {
@@ -293,7 +872,9 @@ export default function App() {
       });
       await check("adjust", async () => {
         const grey = grayscale(struct);
-        for (let i = 0; i < grey.data.length; i += 997) {
+        // Sample pixel-aligned offsets only (a stride that is not a
+        // multiple of 4 lands mid-pixel and compares the wrong channels).
+        for (let i = 0; i < grey.data.length; i += 4 * 251) {
           if (grey.data[i] !== grey.data[i + 1] || grey.data[i] !== grey.data[i + 2])
             throw new Error("channels differ after grayscale");
         }
@@ -445,7 +1026,7 @@ export default function App() {
         <dl className="facts">
           <div>
             <dt>version</dt>
-            <dd>1.0.0</dd>
+            <dd>1.0.1</dd>
           </div>
           <div>
             <dt>packages</dt>
@@ -501,6 +1082,12 @@ export default function App() {
           <h2>Placeholders</h2>
           <span className="panel-note">encoded from the same test image</span>
         </div>
+        <div className="controls">
+          <button className="btn-primary" disabled={!shared} onClick={() => void useUploadedForHashes()}>
+            Generate from my uploaded image
+          </button>
+          <span className="file-name">source · {hashSource}</span>
+        </div>
         <div className="hash-grid">
           <div>
             {hashes ? (
@@ -529,53 +1116,7 @@ export default function App() {
         </div>
       </section>
 
-      <section className="panel">
-        <div className="panel-head">
-          <span className="panel-index">05</span>
-          <h2>Process a file</h2>
-          <span className="panel-note">useProcessImage · @dusrel/image-react</span>
-        </div>
-        <div className="controls">
-          <label className="file-label">
-            Choose an image
-            <input
-              className="file-input"
-              type="file"
-              accept="image/*"
-              onChange={(e) => setPicked(e.target.files?.[0] ?? null)}
-            />
-          </label>
-          {picked && (
-            <span className="file-name">
-              {picked.name} · {fmtBytes(picked.size)}
-            </span>
-          )}
-          <button
-            className="btn-primary"
-            disabled={!picked || proc.status === "processing"}
-            onClick={() =>
-              picked && void proc.process(picked, { resize: { width: 800 }, format: "image/webp" })
-            }
-          >
-            Resize to 800px WebP
-          </button>
-        </div>
-        <p className="status-line" data-testid="process-status">
-          status · {proc.status}
-        </p>
-        {proc.result && (
-          <p className="readout" data-testid="process-result">
-            {proc.result.format} · {fmtBytes(proc.result.blob.size)} · {proc.result.width}×
-            {proc.result.height} · saved {Math.round((proc.result.report?.savingsRatio ?? 0) * 100)}
-            %
-          </p>
-        )}
-        {proc.error != null && (
-          <p className="readout readout-error">
-            {proc.error instanceof Error ? proc.error.message : String(proc.error)}
-          </p>
-        )}
-      </section>
+      <ProcessStudio onShare={setShared} />
 
       <section className="panel">
         <div className="panel-head">
@@ -583,11 +1124,14 @@ export default function App() {
           <h2>Crop component</h2>
           <span className="panel-note">DusrelCrop · @dusrel/image-react</span>
         </div>
-        {demoUrl && (
+        {(shared?.url ?? demoUrl) && (
           <div className="crop-wrap">
-            <DusrelCrop src={demoUrl} aspect="4/3" onCropChange={setCrop} />
+            <DusrelCrop src={shared?.url ?? demoUrl} aspect="4/3" onCropChange={setCrop} />
           </div>
         )}
+        <p className="file-name">
+          {shared ? `cropping your upload · ${shared.name}` : "cropping the built-in demo image — upload a file in panel 05 to crop your own"}
+        </p>
         <p className="readout" data-testid="crop-value">
           {crop ? JSON.stringify(crop) : "no crop yet"}
         </p>

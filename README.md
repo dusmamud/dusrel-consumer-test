@@ -39,6 +39,22 @@ provides natively.
 every emitted codec asset (byte-exact sizes). The dev server was
 probed at the URL level for both asset strategies.
 
+## Update (2026-11-09, packages @ 1.0.1)
+
+- The in-browser lab grew from 5 to **25 checks covering every
+  installed package**, plus a full **process studio**: one uploaded
+  image drives every tool — all output formats (canvas + every WASM
+  codec registered), resize/crop/rotate/flip, adjust sliders,
+  watermark, target size, metadata readout + strip download, HEIC
+  uploads decoded via WASM, batch mode over many files, and the same
+  upload feeding the crop component and the placeholder generator.
+- **The lab caught a real library bug:** calling `setCodecAssets`
+  after a codec's first use silently returned empty output (0-byte
+  JPEG) in the Emscripten wrappers. Fixed upstream in **1.0.1**
+  (per-instance function binding + browser regression specs); this
+  project now installs 1.0.1 and its JPEG `?url` check asserts a
+  valid, non-empty JPEG.
+
 ## Results (2026-11-08, packages @ 1.0.0)
 
 - Install from registry: OK (22 packages; `@dusrel/image-vue` and
