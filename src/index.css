@@ -511,6 +511,64 @@ a.file-label {
   text-decoration: none;
 }
 
+.result-card {
+  display: flex;
+  gap: 20px;
+  align-items: center;
+  margin-top: 20px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface-2);
+}
+
+.result-thumb {
+  width: 200px;
+  max-height: 140px;
+  object-fit: contain;
+  border-radius: 8px;
+  background: var(--surface);
+  flex: none;
+}
+
+.result-badge {
+  width: 200px;
+  height: 112px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: var(--surface);
+  border: 1px dashed var(--line);
+  font-family: var(--mono);
+  font-size: 20px;
+  color: var(--accent);
+}
+
+.result-info {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.result-title {
+  font-size: 15px;
+  color: var(--text);
+}
+
+.result-sub {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.result-dl {
+  text-decoration: none;
+  display: inline-block;
+}
+
 /* Footer ------------------------------------------------------------ */
 .footer {
   display: flex;

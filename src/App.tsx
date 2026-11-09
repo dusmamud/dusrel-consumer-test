@@ -153,9 +153,6 @@ function drawGradient(canvas: HTMLCanvasElement) {
 /* ------------------------------------------------------------------ */
 
 const FORMAT_OPTIONS = [
-  { id: "canvas-webp", label: "WebP — canvas", format: "image/webp", codec: null },
-  { id: "canvas-jpeg", label: "JPEG — canvas", format: "image/jpeg", codec: null },
-  { id: "canvas-png", label: "PNG — canvas", format: "image/png", codec: null },
   { id: "wasm-avif", label: "AVIF — WASM · libaom", format: "image/avif", codec: "avif" },
   { id: "wasm-jpeg", label: "JPEG — WASM · MozJPEG", format: "image/jpeg", codec: "jpeg" },
   { id: "wasm-webp", label: "WebP — WASM · libwebp", format: "image/webp", codec: "webp" },
@@ -163,6 +160,9 @@ const FORMAT_OPTIONS = [
   { id: "wasm-jxl", label: "JPEG XL — WASM · libjxl", format: "image/jxl", codec: "jxl" },
   { id: "wasm-qoi", label: "QOI — WASM", format: "image/qoi", codec: "qoi" },
   { id: "wasm-gif", label: "GIF — WASM · single frame", format: "image/gif", codec: "gif" },
+  { id: "canvas-webp", label: "WebP — canvas (core built-in)", format: "image/webp", codec: null },
+  { id: "canvas-jpeg", label: "JPEG — canvas (core built-in)", format: "image/jpeg", codec: null },
+  { id: "canvas-png", label: "PNG — canvas (core built-in)", format: "image/png", codec: null },
 ] as const;
 
 type FormatOption = (typeof FORMAT_OPTIONS)[number];
@@ -231,7 +231,7 @@ function ProcessStudio({
   >([]);
   const [inputUrl, setInputUrl] = useState<string>("");
   const [inputMeta, setInputMeta] = useState<string[]>([]);
-  const [formatId, setFormatId] = useState<string>("canvas-webp");
+  const [formatId, setFormatId] = useState<string>("wasm-avif");
   const [quality, setQuality] = useState(85);
   const [resizeW, setResizeW] = useState("800");
   const [resizeH, setResizeH] = useState("");
@@ -317,6 +317,24 @@ function ProcessStudio({
       setInputUrl(URL.createObjectURL(file));
       setInputMeta(["metadata · could not be read"]);
     }
+  };
+
+  const loadTestImage = async () => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 320;
+    canvas.height = 180;
+    drawGradient(canvas);
+    const blob = await new Promise<Blob>((resolve, reject) =>
+      canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("canvas.toBlob failed"))), "image/png"),
+    );
+    await onPick(new File([blob], "test-image.png", { type: "image/png" }));
+  };
+
+  const loadSampleHeic = async () => {
+    const res = await fetch("/sample.heic");
+    if (!res.ok) return;
+    const blob = await res.blob();
+    await onPick(new File([blob], "sample.heic", { type: "image/heic" }));
   };
 
   const onStrip = () => {
@@ -463,6 +481,12 @@ function ProcessStudio({
           />
         </label>
         {picked && <span className="file-name">{pickedLabel}</span>}
+        <button className="btn-primary" onClick={() => void loadTestImage()}>
+          Use the built-in test image
+        </button>
+        <button className="btn-primary" onClick={() => void loadSampleHeic()}>
+          Use sample.heic
+        </button>
       </div>
 
       {picked && (
@@ -512,11 +536,20 @@ function ProcessStudio({
         <label className="field">
           <span>Output format</span>
           <select value={formatId} onChange={(e) => setFormatId(e.target.value)}>
-            {FORMAT_OPTIONS.map((f) => (
-              <option key={f.id} value={f.id}>
-                {f.label}
-              </option>
-            ))}
+            <optgroup label="WASM codec packages (dedicated @dusrel packages)">
+              {FORMAT_OPTIONS.filter((f) => f.codec).map((f) => (
+                <option key={f.id} value={f.id}>
+                  {f.label}
+                </option>
+              ))}
+            </optgroup>
+            <optgroup label="Core canvas engine (built into @dusrel/image-core, no WASM download)">
+              {FORMAT_OPTIONS.filter((f) => !f.codec).map((f) => (
+                <option key={f.id} value={f.id}>
+                  {f.label}
+                </option>
+              ))}
+            </optgroup>
           </select>
         </label>
         {range("Quality", quality, setQuality, 5, 100, "")}
@@ -607,11 +640,6 @@ function ProcessStudio({
         <button className="btn-primary" disabled={!picked || proc.status === "processing"} onClick={runProcess}>
           Process image
         </button>
-        {proc.result && outUrl && (
-          <a className="file-label" href={outUrl} download={`processed.${(proc.result.format.split("/")[1] ?? "bin").replace("jpeg", "jpg")}`}>
-            Download result
-          </a>
-        )}
         {fmt?.codec && <span className="file-name">WASM codec loads on first use</span>}
       </div>
 
@@ -640,6 +668,33 @@ function ProcessStudio({
         <p className="readout readout-error">
           {proc.error instanceof Error ? proc.error.message : String(proc.error)}
         </p>
+      )}
+      {proc.result && outUrl && (
+        <div className="result-card">
+          {displayable ? (
+            <img className="result-thumb" src={outUrl} alt="Processed result preview" />
+          ) : (
+            <div className="result-badge">{proc.result.format.replace("image/", "").toUpperCase()}</div>
+          )}
+          <div className="result-info">
+            <div className="result-title">
+              Result · {proc.result.format} · {fmtBytes(proc.result.blob.size)} · {proc.result.width}×
+              {proc.result.height}
+            </div>
+            <div className="result-sub">
+              saved {Math.round((proc.result.report?.savingsRatio ?? 0) * 100)}% ·{" "}
+              {Math.round(proc.result.report?.durationMs ?? 0)} ms
+              {!displayable && " · this browser cannot preview this format — download it to view"}
+            </div>
+            <a
+              className="btn-primary result-dl"
+              href={outUrl}
+              download={`processed.${(proc.result.format.split("/")[1] ?? "bin").replace("jpeg", "jpg")}`}
+            >
+              Download result
+            </a>
+          </div>
+        </div>
       )}
 
       <div className="panel-head">
