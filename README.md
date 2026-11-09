@@ -9,13 +9,18 @@ registry.npmjs.org.
 
 ## What is tested
 
-**`npm run build`** — `tsc -b && vite build` over `src/App.tsx`, which
-uses `useProcessImage` + `DusrelCrop` from `@dusrel/image-react`, WASM
-codec encodes from `@dusrel/image-jpeg` / `-webp` / `-png` (default
-asset URLs *and* the `setCodecAssets` + `?url` pattern), and
-ThumbHash/BlurHash from `@dusrel/image-placeholder`. The app runs the
-codec lab automatically on page load and reports each result in the
-page.
+**`npm run build`** — `tsc -b && vite build` over `src/App.tsx`. The
+app is a live test bench (deployed at
+dusrel-consumer-test.pages.dev): on page load it runs **25 in-browser
+checks covering every installed package** — all eleven codec packages
+(JPEG/WebP/PNG encode + roundtrips, AVIF, JXL, QOI, GIF + optimise,
+HEIC decode of `public/sample.heic`, a libheif example file), the
+feature packages (oxipng, quantize, resize, transform, adjust,
+metadata EXIF GPS + strip, watermark, SVG), and the platform layer
+(core `processImage`, flagship `processImage` with a registered AVIF
+codec, batch pool ordering, crop geometry, placeholder roundtrips) —
+plus interactive `useProcessImage` and `DusrelCrop` demos from
+`@dusrel/image-react`. A header pill counts the checks as they pass.
 
 **`node scripts/smoke.mjs`** — a 43-check pack-smoke suite against the
 installed packages: export surface of all 22 installed packages, real
