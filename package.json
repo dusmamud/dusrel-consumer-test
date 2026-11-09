@@ -1,0 +1,47 @@
+{
+  "name": "dusrel-consumer-test",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "oxlint",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@dusrel/image": "^1.0.0",
+    "@dusrel/image-adjust": "^1.0.0",
+    "@dusrel/image-avif": "^1.0.0",
+    "@dusrel/image-batch": "^1.0.0",
+    "@dusrel/image-core": "^1.0.0",
+    "@dusrel/image-crop": "^1.0.0",
+    "@dusrel/image-gif": "^1.0.0",
+    "@dusrel/image-heic": "^1.0.0",
+    "@dusrel/image-jpeg": "^1.0.0",
+    "@dusrel/image-jxl": "^1.0.0",
+    "@dusrel/image-metadata": "^1.0.0",
+    "@dusrel/image-oxipng": "^1.0.0",
+    "@dusrel/image-placeholder": "^1.0.0",
+    "@dusrel/image-png": "^1.0.0",
+    "@dusrel/image-qoi": "^1.0.0",
+    "@dusrel/image-quantize": "^1.0.0",
+    "@dusrel/image-react": "^1.0.0",
+    "@dusrel/image-resize": "^1.0.0",
+    "@dusrel/image-svg": "^1.0.0",
+    "@dusrel/image-transform": "^1.0.0",
+    "@dusrel/image-watermark": "^1.0.0",
+    "@dusrel/image-webp": "^1.0.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "oxlint": "^1.90.0",
+    "typescript": "~7.0.2",
+    "vite": "^8.3.6"
+  }
+}
