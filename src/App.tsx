@@ -21,6 +21,16 @@ import jpegDecWasm from "@dusrel/image-jpeg/codec/mozjpeg_dec.wasm?url";
 
 type LabLine = { id: string; ok: boolean | null; text: string };
 
+const CHECKS: { id: string; name: string; hint: string }[] = [
+  { id: "jpeg-default", name: "JPEG encode", hint: "MozJPEG, default asset URLs" },
+  { id: "webp-default", name: "WebP encode", hint: "libwebp, default asset URLs" },
+  { id: "png-default", name: "PNG encode", hint: "Rust png crate, default asset URLs" },
+  { id: "jpeg-url", name: "JPEG encode", hint: "MozJPEG, setCodecAssets with ?url imports" },
+  { id: "placeholder", name: "Placeholders", hint: "ThumbHash and BlurHash roundtrip" },
+];
+
+const fmtBytes = (n: number) => `${n.toLocaleString("en-US")} bytes`;
+
 function drawGradient(canvas: HTMLCanvasElement) {
   const ctx = canvas.getContext("2d")!;
   const grad = ctx.createLinearGradient(0, 0, canvas.width, canvas.height);
@@ -56,25 +66,23 @@ export default function App() {
     (async () => {
       const ctx = canvas.getContext("2d")!;
       const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const run = async (id: string, label: string, fn: () => Promise<Uint8Array>) => {
+      const run = async (id: string, fn: () => Promise<Uint8Array>) => {
         try {
           const out = await fn();
           if (!cancelled)
-            log(id, true, `${label}: OK (${out.length} bytes, magic ${Array.from(out.slice(0, 4)).join(",")})`);
+            log(id, true, `${fmtBytes(out.length)} · magic ${Array.from(out.slice(0, 4)).join(", ")}`);
         } catch (err) {
-          if (!cancelled) log(id, false, `${label}: FAILED (${err instanceof Error ? err.message : String(err)})`);
+          if (!cancelled) log(id, false, err instanceof Error ? err.message : String(err));
         }
       };
       // 1) Default asset resolution (new URL relative to import.meta.url)
-      await run("jpeg-default", "JPEG encode, default assets", async () =>
+      await run("jpeg-default", async () =>
         new Uint8Array(await encodeJpeg(pixels, { quality: 82 })),
       );
-      await run("webp-default", "WebP encode, default assets", async () =>
+      await run("webp-default", async () =>
         new Uint8Array(await encodeWebp(pixels, { quality: 82 })),
       );
-      await run("png-default", "PNG encode, default assets", async () =>
-        new Uint8Array(await encodePng(pixels)),
-      );
+      await run("png-default", async () => new Uint8Array(await encodePng(pixels)));
       // 2) The ?url escape hatch for the same JPEG codec
       setJpegAssets({
         encodeJsUrl: jpegEncJs,
@@ -82,7 +90,7 @@ export default function App() {
         decodeJsUrl: jpegDecJs,
         decodeWasmUrl: jpegDecWasm,
       });
-      await run("jpeg-url", "JPEG encode, ?url assets", async () =>
+      await run("jpeg-url", async () =>
         new Uint8Array(await encodeJpeg(pixels, { quality: 82 })),
       );
       // 3) Placeholders from the same pixels
@@ -100,11 +108,15 @@ export default function App() {
         }
         if (!cancelled) {
           setHashes({ thumb: thumbHashToBase64(thumb), blur });
-          log("placeholder", true, `Placeholders: OK (thumbhash decode ${back.width}x${back.height}, blurhash decode ${blurBack.width}x${blurBack.height})`);
+          log(
+            "placeholder",
+            true,
+            `ThumbHash decoded ${back.width}×${back.height} · BlurHash decoded ${blurBack.width}×${blurBack.height}`,
+          );
         }
       } catch (err) {
         if (!cancelled)
-          log("placeholder", false, `Placeholders: FAILED (${err instanceof Error ? err.message : String(err)})`);
+          log("placeholder", false, err instanceof Error ? err.message : String(err));
       }
       (window as unknown as { __DUSREL_TESTS_DONE__: boolean }).__DUSREL_TESTS_DONE__ = true;
     })();
@@ -113,63 +125,189 @@ export default function App() {
     };
   }, []);
 
+  const doneCount = lines.length;
+  const failCount = lines.filter((l) => l.ok === false).length;
+  const pillState = doneCount < CHECKS.length ? "run" : failCount > 0 ? "fail" : "pass";
+  const pillText =
+    doneCount < CHECKS.length
+      ? `Running checks · ${doneCount}/${CHECKS.length}`
+      : failCount > 0
+        ? `${failCount} of ${CHECKS.length} checks failed`
+        : `All ${CHECKS.length} checks passed`;
+
   return (
-    <main style={{ fontFamily: "system-ui, sans-serif", margin: "2rem auto", maxWidth: 880, padding: "0 1rem" }}>
-      <h1>@dusrel/image — consumer test (React + Vite)</h1>
-      <p>
-        Every package below was installed from the npm registry at version 1.0.0. The codec lab
-        runs automatically on page load.
-      </p>
-
-      <h2>Codec lab</h2>
-      <canvas ref={labCanvasRef} width={320} height={180} style={{ border: "1px solid #888" }} />
-      <ul>
-        {lines.map((l) => (
-          <li key={l.id} data-testid={`lab-${l.id}`} style={{ color: l.ok === null ? "#666" : l.ok ? "green" : "crimson" }}>
-            {l.text}
-          </li>
-        ))}
-      </ul>
-      {hashes && (
-        <div>
-          <p>
-            ThumbHash: <code data-testid="thumbhash">{hashes.thumb}</code>
-          </p>
-          <p>
-            BlurHash: <code data-testid="blurhash">{hashes.blur}</code>
-          </p>
-          <canvas ref={thumbCanvasRef} style={{ border: "1px solid #888", width: 96 }} />
+    <div className="page">
+      <header className="topbar">
+        <div className="brand">
+          <span className="brand-mark" />
+          @dusrel/image
+          <span className="brand-sub">consumer test</span>
         </div>
-      )}
-
-      <h2>Process a file (useProcessImage)</h2>
-      <input type="file" accept="image/*" onChange={(e) => setPicked(e.target.files?.[0] ?? null)} />
-      <button
-        disabled={!picked || proc.status === "processing"}
-        onClick={() => picked && void proc.process(picked, { resize: { width: 800 }, format: "image/webp" })}
-      >
-        Resize to 800px WebP
-      </button>
-      <p data-testid="process-status">status: {proc.status}</p>
-      {proc.result && (
-        <p data-testid="process-result">
-          {proc.result.format}: {proc.result.blob.size} bytes, {proc.result.width}x{proc.result.height},
-          saved {Math.round((proc.result.report?.savingsRatio ?? 0) * 100)}%
-        </p>
-      )}
-      {proc.error != null && (
-        <p style={{ color: "crimson" }}>
-          {proc.error instanceof Error ? proc.error.message : String(proc.error)}
-        </p>
-      )}
-
-      <h2>Crop component (DusrelCrop)</h2>
-      {demoUrl && (
-        <div style={{ width: 480 }}>
-          <DusrelCrop src={demoUrl} aspect="4/3" onCropChange={setCrop} />
+        <div className="status-pill">
+          <span className="status-dot" data-state={pillState} />
+          {pillText}
         </div>
-      )}
-      <p data-testid="crop-value">{crop ? JSON.stringify(crop) : "no crop yet"}</p>
-    </main>
+      </header>
+
+      <div className="intro">
+        <h1>The published packages, exercised in a real app</h1>
+        <p className="lede">
+          This page is a separate React + Vite project. Nothing here comes from the library's
+          monorepo — every package was installed from the npm registry, and the codec lab below
+          runs against the shipped WASM artifacts on page load.
+        </p>
+        <dl className="facts">
+          <div>
+            <dt>version</dt>
+            <dd>1.0.0</dd>
+          </div>
+          <div>
+            <dt>packages</dt>
+            <dd>22 from npm</dd>
+          </div>
+          <div>
+            <dt>stack</dt>
+            <dd>React + Vite + TypeScript</dd>
+          </div>
+          <div>
+            <dt>backend</dt>
+            <dd>none — all client-side</dd>
+          </div>
+        </dl>
+      </div>
+
+      <section className="panel">
+        <div className="panel-head">
+          <span className="panel-index">01</span>
+          <h2>Codec lab</h2>
+          <span className="panel-note">runs automatically on load</span>
+        </div>
+        <div className="lab-grid">
+          <div>
+            <canvas ref={labCanvasRef} className="frame" width={320} height={180} />
+            <div className="frame-caption">test image · 320×180 · drawn in code</div>
+          </div>
+          <ul className="checks">
+            {CHECKS.map((check) => {
+              const line = lines.find((l) => l.id === check.id);
+              const state = line ? (line.ok ? "pass" : "fail") : "run";
+              return (
+                <li key={check.id} className="check" data-testid={`lab-${check.id}`}>
+                  <span className="status-dot" data-state={state} />
+                  <span className="check-name">{check.name}</span>
+                  <span className="check-detail" data-ok={line ? String(line.ok) : undefined}>
+                    {line ? line.text : check.hint}
+                  </span>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="panel-head">
+          <span className="panel-index">02</span>
+          <h2>Placeholders</h2>
+          <span className="panel-note">encoded from the same test image</span>
+        </div>
+        <div className="hash-grid">
+          <div>
+            {hashes ? (
+              <>
+                <div className="hash-row">
+                  <div className="hash-label">ThumbHash</div>
+                  <div className="hash-value" data-testid="thumbhash">
+                    {hashes.thumb}
+                  </div>
+                </div>
+                <div className="hash-row">
+                  <div className="hash-label">BlurHash</div>
+                  <div className="hash-value" data-testid="blurhash">
+                    {hashes.blur}
+                  </div>
+                </div>
+              </>
+            ) : (
+              <p className="waiting">Waiting for the codec lab to reach the placeholder step</p>
+            )}
+          </div>
+          <div>
+            <canvas ref={thumbCanvasRef} className="thumb-preview" />
+            <div className="frame-caption">ThumbHash, decoded back</div>
+          </div>
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="panel-head">
+          <span className="panel-index">03</span>
+          <h2>Process a file</h2>
+          <span className="panel-note">useProcessImage · @dusrel/image-react</span>
+        </div>
+        <div className="controls">
+          <label className="file-label">
+            Choose an image
+            <input
+              className="file-input"
+              type="file"
+              accept="image/*"
+              onChange={(e) => setPicked(e.target.files?.[0] ?? null)}
+            />
+          </label>
+          {picked && (
+            <span className="file-name">
+              {picked.name} · {fmtBytes(picked.size)}
+            </span>
+          )}
+          <button
+            className="btn-primary"
+            disabled={!picked || proc.status === "processing"}
+            onClick={() =>
+              picked && void proc.process(picked, { resize: { width: 800 }, format: "image/webp" })
+            }
+          >
+            Resize to 800px WebP
+          </button>
+        </div>
+        <p className="status-line" data-testid="process-status">
+          status · {proc.status}
+        </p>
+        {proc.result && (
+          <p className="readout" data-testid="process-result">
+            {proc.result.format} · {fmtBytes(proc.result.blob.size)} · {proc.result.width}×
+            {proc.result.height} · saved {Math.round((proc.result.report?.savingsRatio ?? 0) * 100)}
+            %
+          </p>
+        )}
+        {proc.error != null && (
+          <p className="readout readout-error">
+            {proc.error instanceof Error ? proc.error.message : String(proc.error)}
+          </p>
+        )}
+      </section>
+
+      <section className="panel">
+        <div className="panel-head">
+          <span className="panel-index">04</span>
+          <h2>Crop component</h2>
+          <span className="panel-note">DusrelCrop · @dusrel/image-react</span>
+        </div>
+        {demoUrl && (
+          <div className="crop-wrap">
+            <DusrelCrop src={demoUrl} aspect="4/3" onCropChange={setCrop} />
+          </div>
+        )}
+        <p className="readout" data-testid="crop-value">
+          {crop ? JSON.stringify(crop) : "no crop yet"}
+        </p>
+      </section>
+
+      <footer className="footer">
+        <a href="https://www.npmjs.com/package/@dusrel/image">@dusrel/image on npm</a>
+        <a href="https://github.com/dusmamud/dusrel-image">library source</a>
+        <a href="https://github.com/dusmamud/dusrel-consumer-test">this app's source</a>
+      </footer>
+    </div>
   );
 }
